@@ -19,3 +19,5 @@ tested with >>> torch.__version__
 Cuda 10.2 .
 
 LRP-gamma is missing, i will add it after the AI.SG summer school because it is a coding task for them :) .
+
+Apologies for hordes of print statements like mushrooms after long rain, and for not writing much explanatory text. code has a structure. i will upload explanatory slides on that soon. I dont have the time for blog like texts, though i appreciate people who write deep explanations like jonathan hui on medium or lilian weng.
