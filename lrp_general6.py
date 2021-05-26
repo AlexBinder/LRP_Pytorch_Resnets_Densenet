@@ -35,7 +35,17 @@ class oneparam_wrapper_class(nn.Module):
     y=self.wrapper.apply( x, self.module,self.parameter1)
     return y
 
+class twoparam_wrapper_class(nn.Module):
+  def __init__(self, module, autogradfunction, parameter1, parameter2):
+    super(twoparam_wrapper_class, self).__init__()
+    self.module=module
+    self.wrapper=autogradfunction
+    self.parameter1=parameter1
+    self.parameter2 = parameter2
 
+  def forward(self,x):
+    y=self.wrapper.apply( x, self.module,self.parameter1, self.parameter2)
+    return y
 
 class conv2d_zbeta_wrapper_class(nn.Module):
   def __init__(self, module, lrpignorebias,lowest  = None, highest = None  ):
@@ -109,8 +119,22 @@ def get_lrpwrapperformodule(module, lrp_params, lrp_layer2method, thisis_inputco
         raise lrplookupnotfounderror( "found no dictionary entry in lrp_layer2method for this module name:", key)
 
       #default conv2d_beta0_wrapper_fct()
+      #autogradfunction = lrp_layer2method[key]()
+      #return oneparam_wrapper_class(module, autogradfunction = autogradfunction, parameter1 = lrp_params['conv2d_ignorebias'] )
+
       autogradfunction = lrp_layer2method[key]()
-      return oneparam_wrapper_class(module, autogradfunction = autogradfunction, parameter1 = lrp_params['conv2d_ignorebias'] )
+      
+
+      if type(autogradfunction) == conv2d_beta0_wrapper_fct: # dont want test for derived classes but equality
+        return oneparam_wrapper_class(module, autogradfunction = autogradfunction, parameter1 = lrp_params['conv2d_ignorebias'] )
+      elif type(autogradfunction) == conv2d_betaany_wrapper_fct: 
+        return twoparam_wrapper_class(module, autogradfunction = autogradfunction, parameter1 = lrp_params['conv2d_ignorebias'], parameter2 = torch.tensor( lrp_params['conv2d_beta']) )
+      elif type(autogradfunction) == conv2d_betaadaptive_wrapper_fct: 
+        return twoparam_wrapper_class(module, autogradfunction = autogradfunction, parameter1 = lrp_params['conv2d_ignorebias'], parameter2 = torch.tensor( lrp_params['conv2d_maxbeta']) )
+      else:
+        print('unknown autogradfunction', type(autogradfunction) )
+        exit()
+
 
   elif isinstance(module, nn.AdaptiveAvgPool2d):
 
@@ -197,21 +221,6 @@ def get_lrpwrapperformodule(module, lrp_params, lrp_layer2method, thisis_inputco
     print("found no lookup for this module:", module)
     raise lrplookupnotfounderror( "found no lookup for this module:", module)
 
-'''
-#replaced by sum2 with torch.stack([x1,x2],dim=0)
-# resnet specific, because it calls 2 inputs x1,x2
-class eltwise2_wrapper_class(nn.Module):
-  def __init__(self,eps):
-    super(eltwise2_wrapper_class, self).__init__()
-
-    self.module=eltwisesum2()
-    self.wrapper=eltwisesum_eps_wrapper_fct()
-    self.eps=eps
-
-  def forward(self,x1,x2):
-    y=self.wrapper.apply( x1,x2, self.module,self.eps)
-    return y
-'''
 
 #######################################################
 #######################################################
@@ -608,7 +617,9 @@ class conv2d_beta0_wrapper_fct(torch.autograd.Function):
         #print('conv2d custom input_.shape', input_.shape )
 
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output[0], eps0 = 1e-12, eps=0)
+        R= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output, eps0 = 1e-12, eps=0)
+        #R= lrp_backward(_input= X , layer = pnconv , relevance_output = torch.ones_like(grad_output), eps0 = 1e-12, eps=0)
+        #print( 'beta 0 negR' ,torch.mean((R<0).float()).item() ) # no neg relevance
 
         #print('conv2d custom R', R.shape )
         #exit()
@@ -714,10 +725,6 @@ class conv2d_zbeta_wrapper_fct(torch.autograd.Function):
 
         print('zbeta conv2dconstr weights')
 
-        #pnconv = posnegconv(conv2dclass, ignorebias=True)
-        #X = input_.clone().detach().requires_grad_(True)
-        #R= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output[0], eps0 = 1e-12, eps=0)
-
         any_conv =  anysign_conv( module, ignorebias=lrpignorebiastensor.item())
 
         X = input_.clone().detach().requires_grad_(True)
@@ -726,13 +733,134 @@ class conv2d_zbeta_wrapper_fct(torch.autograd.Function):
 
         with torch.enable_grad():
             Z = any_conv.forward(mode='justasitis', x=X) - any_conv.forward(mode='pos', x=L) - any_conv.forward(mode='neg', x=H) 
-            S = safe_divide(grad_output[0].clone().detach(), Z.clone().detach(), eps0=1e-6, eps=1e-6)
+            S = safe_divide(grad_output.clone().detach(), Z.clone().detach(), eps0=1e-6, eps=1e-6)
             Z.backward(S)
             R = (X * X.grad + L * L.grad + H * H.grad).detach()
 
         print('zbeta conv2d custom R', R.shape )
         #exit()
         return R,None,None,None, None # for  (x, conv2dclass,lrpignorebias, lowest, highest)
+
+
+class conv2d_betaadaptive_wrapper_fct(torch.autograd.Function):
+    """
+    We can implement our own custom autograd Functions by subclassing
+    torch.autograd.Function and implementing the forward and backward passes
+    which operate on Tensors.
+    """
+    @staticmethod
+    def forward(ctx, x, module, lrpignorebias, maxbeta):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+
+        def configvalues_totensorlist(module):
+            #[module.in_channels, module.out_channels, module.kernel_size, **{attr: getattr(module, attr) for attr in ['stride', 'padding', 'dilation', 'groups']}
+
+            propertynames=['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'dilation', 'groups']
+            values=[]
+            for attr in propertynames:
+              v = getattr(module, attr)
+              # convert it into tensor
+              # has no treatment for booleans yet
+              if isinstance(v, int):
+                v=  torch.tensor([v], dtype=torch.int32, device= module.weight.device) 
+              elif isinstance(v, tuple):
+                ################
+                ################
+                # FAILMODE: if it is not a tuple of ints but e.g. a tuple of floats, or a tuple of a tuple
+    
+                v= torch.tensor(v, dtype=torch.int32, device= module.weight.device)     
+              else:
+                print('v is neither int nor tuple. unexpected')
+                exit()
+              values.append(v)
+            return propertynames,values
+        ### end of def classproperties2lists(conv2dclass): #####################
+
+
+        #stash module config params and trainable params
+        propertynames,values=configvalues_totensorlist(module)
+
+        if module.bias is None:
+          bias=None
+        else:
+          bias= module.bias.data.clone()
+        lrpignorebiastensor=torch.tensor([lrpignorebias], dtype=torch.bool, device= module.weight.device)
+        ctx.save_for_backward(x, module.weight.data.clone(), bias, lrpignorebiastensor, maxbeta, *values ) # *values unpacks the list
+
+        #print('ctx.needs_input_grad',ctx.needs_input_grad)
+        #exit()
+
+        #print('conv2d custom forward')
+        return module.forward(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+        
+        #print('len(grad_output)',len(grad_output),grad_output[0].shape)
+
+        input_, conv2dweight, conv2dbias, lrpignorebiastensor, maxbeta, *values  = ctx.saved_tensors
+        #print('retrieved', len(values))
+        #######################################################################
+        # reconstruct dictionary of config parameters
+        def tensorlist_todict(values): 
+            propertynames=['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'dilation', 'groups']
+            # idea: paramsdict={ n: values[i]  for i,n in enumerate(propertynames)  } # but needs to turn tensors to ints or tuples!
+            paramsdict={}
+            for i,n in enumerate(propertynames):
+              v=values[i]
+              if v.numel==1:
+                  paramsdict[n]=v.item() #to cpu?
+              else:
+                  alist=v.tolist()
+                  #print('alist',alist)
+                  if len(alist)==1:
+                    paramsdict[n]=alist[0]
+                  else:
+                    paramsdict[n]= tuple(alist)
+            return paramsdict
+        #######################################################################
+        paramsdict=tensorlist_todict(values)
+
+        if conv2dbias is None:
+          module=nn.Conv2d( **paramsdict, bias=False )
+        else:
+          module=nn.Conv2d( **paramsdict, bias=True )
+          module.bias= torch.nn.Parameter(conv2dbias)
+                
+        #print('conv2dconstr')
+        module.weight= torch.nn.Parameter(conv2dweight)
+
+        #print('conv2dconstr weights')
+
+        pnconv = posnegconv(module, ignorebias = lrpignorebiastensor.item())
+        invertedpnconv = invertedposnegconv(module, ignorebias = lrpignorebiastensor.item())
+
+
+        #print('get ratios per output')
+        # betatensor =  -neg / conv but care for zeros
+        X = input_.clone().detach()
+        out = module(X)
+        negscores = -invertedpnconv(X)
+        betatensor = torch.zeros_like(out)
+        betatensor[ out>0 ] = torch.minimum( negscores[ out>0 ] / out [ out>0 ], maxbeta)
+
+        X.requires_grad_(True)
+        R1= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output * (1+betatensor), eps0 = 1e-12, eps=0)
+        R2= lrp_backward(_input= X , layer = invertedpnconv , relevance_output = grad_output * betatensor, eps0 = 1e-12, eps=0)
+
+
+        R = R1 -R2
+        return R, None, None, None
 
 
 
@@ -826,7 +954,7 @@ class adaptiveavgpool2d_wrapper_fct(torch.autograd.Function):
         print('adaptiveavg2d custom input_.shape', input_.shape )
 
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = layerclass , relevance_output = grad_output[0], eps0 = eps, eps=eps)
+        R= lrp_backward(_input= X , layer = layerclass , relevance_output = grad_output, eps0 = eps, eps=eps)
 
         print('adaptiveavg2dcustom R', R.shape )
         #exit()
@@ -928,7 +1056,10 @@ class maxpool2d_wrapper_fct(torch.autograd.Function):
         #R= lrp_backward(_input= X , layer = layerclass , relevance_output = grad_output[0], eps0 = 1e-12, eps=0)    
         with torch.enable_grad():
             Z = layerclass.forward(X)
-        relevance_output_data = grad_output[0].clone().detach().unsqueeze(0)
+        #print('type(grad_output)', type(grad_output))
+        #print('type(grad_output)', grad_output.shape)
+        #exit()
+        relevance_output_data = grad_output.clone().detach() #.unsqueeze(0)
         Z.backward(relevance_output_data)
         R = X.grad
         
@@ -1028,7 +1159,7 @@ class avgpool2d_wrapper_fct(torch.autograd.Function):
         layerclass= torch.nn.AvgPool2d(**paramsdict)
         eps=epstensor.item()
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = layerclass , relevance_output = grad_output[0], eps0 = eps, eps=eps)    
+        R= lrp_backward(_input= X , layer = layerclass , relevance_output = grad_output, eps0 = eps, eps=eps)    
 
         
         print('avgpool R', R.shape )
@@ -1172,7 +1303,7 @@ class linearlayer_eps_wrapper_fct(torch.autograd.Function):
         print('linaer custom input_.shape', input_.shape )
         eps=epstensor.item()
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = module , relevance_output = grad_output[0], eps0 = eps, eps=eps)
+        R= lrp_backward(_input= X , layer = module , relevance_output = grad_output, eps0 = eps, eps=eps)
 
         print('linaer custom R', R.shape )
         #exit()
@@ -1232,7 +1363,7 @@ class eltwisesum_stacked2_eps_wrapper_fct(torch.autograd.Function): # to be used
         eps=epstensor.item()
 
         s2=sum_stacked2().to(X.device)
-        Rtmp= lrp_backward(_input= X , layer = s2 , relevance_output = grad_output[0], eps0 = eps, eps=eps)
+        Rtmp= lrp_backward(_input= X , layer = s2 , relevance_output = grad_output, eps0 = eps, eps=eps)
 
         #R0=Rtmp[0,:]
         #R1=Rtmp[1,:]
@@ -1346,6 +1477,157 @@ class posnegconv(nn.Module):
         vn= self.negconv ( torch.clamp(x,max=0)  )
         return vp+vn
 
+
+
+class conv2d_betaany_wrapper_fct(torch.autograd.Function):
+    """
+    We can implement our own custom autograd Functions by subclassing
+    torch.autograd.Function and implementing the forward and backward passes
+    which operate on Tensors.
+    """
+    @staticmethod
+    def forward(ctx, x, module, lrpignorebias, beta):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+
+        def configvalues_totensorlist(module):
+            #[module.in_channels, module.out_channels, module.kernel_size, **{attr: getattr(module, attr) for attr in ['stride', 'padding', 'dilation', 'groups']}
+
+            propertynames=['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'dilation', 'groups']
+            values=[]
+            for attr in propertynames:
+              v = getattr(module, attr)
+              # convert it into tensor
+              # has no treatment for booleans yet
+              if isinstance(v, int):
+                v=  torch.tensor([v], dtype=torch.int32, device= module.weight.device) 
+              elif isinstance(v, tuple):
+                ################
+                ################
+                # FAILMODE: if it is not a tuple of ints but e.g. a tuple of floats, or a tuple of a tuple
+    
+                v= torch.tensor(v, dtype=torch.int32, device= module.weight.device)     
+              else:
+                print('v is neither int nor tuple. unexpected')
+                exit()
+              values.append(v)
+            return propertynames,values
+        ### end of def classproperties2lists(conv2dclass): #####################
+
+
+        #stash module config params and trainable params
+        propertynames,values=configvalues_totensorlist(module)
+
+        if module.bias is None:
+          bias=None
+        else:
+          bias= module.bias.data.clone()
+        lrpignorebiastensor=torch.tensor([lrpignorebias], dtype=torch.bool, device= module.weight.device)
+        ctx.save_for_backward(x, module.weight.data.clone(), bias, lrpignorebiastensor, beta, *values ) # *values unpacks the list
+
+        #print('ctx.needs_input_grad',ctx.needs_input_grad)
+        #exit()
+
+        #print('conv2d custom forward')
+        return module.forward(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+        
+        #print('len(grad_output)',len(grad_output),grad_output[0].shape)
+
+        input_, conv2dweight, conv2dbias, lrpignorebiastensor, beta, *values  = ctx.saved_tensors
+        #print('retrieved', len(values))
+        #######################################################################
+        # reconstruct dictionary of config parameters
+        def tensorlist_todict(values): 
+            propertynames=['in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'dilation', 'groups']
+            # idea: paramsdict={ n: values[i]  for i,n in enumerate(propertynames)  } # but needs to turn tensors to ints or tuples!
+            paramsdict={}
+            for i,n in enumerate(propertynames):
+              v=values[i]
+              if v.numel==1:
+                  paramsdict[n]=v.item() #to cpu?
+              else:
+                  alist=v.tolist()
+                  #print('alist',alist)
+                  if len(alist)==1:
+                    paramsdict[n]=alist[0]
+                  else:
+                    paramsdict[n]= tuple(alist)
+            return paramsdict
+        #######################################################################
+        paramsdict=tensorlist_todict(values)
+
+        if conv2dbias is None:
+          module=nn.Conv2d( **paramsdict, bias=False )
+        else:
+          module=nn.Conv2d( **paramsdict, bias=True )
+          module.bias= torch.nn.Parameter(conv2dbias)
+                
+        #print('conv2dconstr')
+        module.weight= torch.nn.Parameter(conv2dweight)
+
+        #print('conv2dconstr weights')
+
+        pnconv = posnegconv(module, ignorebias = lrpignorebiastensor.item())
+        invertedpnconv = invertedposnegconv(module, ignorebias = lrpignorebiastensor.item())
+
+
+        #print('conv2d custom input_.shape', input_.shape )
+
+        X = input_.clone().detach().requires_grad_(True)
+        R1= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output, eps0 = 1e-12, eps=0)
+        R2= lrp_backward(_input= X , layer = invertedpnconv , relevance_output = grad_output, eps0 = -1e-12, eps=0)
+        R = (1+beta)*R1-beta*R2
+        return R, None, None, None
+
+
+        
+
+
+class invertedposnegconv(nn.Module):
+
+
+    def _clone_module(self, module):
+        clone = nn.Conv2d(module.in_channels, module.out_channels, module.kernel_size,
+                     **{attr: getattr(module, attr) for attr in ['stride', 'padding', 'dilation', 'groups']})
+        return clone.to(module.weight.device)
+
+    def __init__(self, conv, ignorebias):
+      super(invertedposnegconv, self).__init__()
+
+      self.posconv=self._clone_module(conv)
+      self.posconv.weight= torch.nn.Parameter( conv.weight.data.clone().clamp(min=0) ).to(conv.weight.device)
+
+      self.negconv=self._clone_module(conv)
+      self.negconv.weight= torch.nn.Parameter( conv.weight.data.clone().clamp(max=0) ).to(conv.weight.device)
+
+      self.posconv.bias=None
+      self.negconv.bias=None
+      if ignorebias==False:
+          if conv.bias is not None:
+              self.posconv.bias= torch.nn.Parameter( conv.bias.data.clone().clamp(min=0) )
+              self.negconv.bias= torch.nn.Parameter( conv.bias.data.clone().clamp(max=0) )
+
+      #print('done init')
+
+    def forward(self,x):
+
+        #note the diff to posnegconv
+        vp= self.posconv (  torch.clamp(x,max=0)  ) #on negatives
+        vn= self.negconv ( torch.clamp(x,min=0) ) #on positives
+
+        return vp+vn # zero or neg
 
 
 ##### input
@@ -1506,7 +1788,7 @@ class tensorbiased_linearlayer_eps_wrapper_fct(torch.autograd.Function):
         print('tesnorbased linaer custom input_.shape', input_.shape )
         eps=epstensor.item()
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = module , relevance_output = grad_output[0], eps0 = eps, eps=eps)
+        R= lrp_backward(_input= X , layer = module , relevance_output = grad_output, eps0 = eps, eps=eps)
 
         print('linaer custom R', R.shape )
         #exit()
@@ -1670,7 +1952,7 @@ class tensorbiasedconv2d_beta0_wrapper_fct(torch.autograd.Function):
         print('conv2d custom input_.shape', input_.shape )
 
         X = input_.clone().detach().requires_grad_(True)
-        R= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output[0], eps0 = 1e-12, eps=0)
+        R= lrp_backward(_input= X , layer = pnconv , relevance_output = grad_output, eps0 = 1e-12, eps=0)
 
         print('conv2d custom R', R.shape )
         #exit()
@@ -1706,6 +1988,9 @@ def lrp_backward(_input, layer, relevance_output, eps0, eps):
     """
     Performs the LRP backward pass, implemented as standard forward and backward passes.
     """
+    #if hasattr(_input,'grad'):
+    if _input.grad is not None:
+      _input.grad.zero_()
     relevance_output_data = relevance_output.clone().detach()
     with torch.enable_grad():
         Z = layer(_input)
