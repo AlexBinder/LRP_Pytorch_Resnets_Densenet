@@ -26,6 +26,13 @@ import matplotlib.pyplot as plt
 
 import copy
 
+import re
+
+from typing import Any, List, Optional, Tuple
+from torchvision.models.densenet import DenseNet121_Weights
+
+from torchvision.models._utils import _ovewrite_named_param
+
 try:
     from torch.hub import load_state_dict_from_url
 except ImportError:
@@ -54,23 +61,18 @@ class densenet_x(models.DenseNet):
     super(densenet_x, self).__init__(growth_rate, block_config,num_init_features, bn_size, drop_rate, num_classes, memory_efficient)
 
     self.toprelu=nn.ReLU()
-    self.toppool= nn.AdaptiveAvgPool2d((1,1)) #nn.AvgPool2d((7,7))
+    self.toppool= nn.AdaptiveAvgPool2d((1,1)) 
 
   def forward(self, x):
 
 
     features = self.features(x)
-    #print('mn',torch.mean(features))
-
 
     out = self.toprelu(features)
-    #print('mn',features.shape)
-
     out = self.toppool(out)
-    print('mn2',out.shape)
+    
     out = torch.flatten(out, 1)
 
-    #exit()
     out = self.classifier(out)
     return out
 
@@ -332,14 +334,14 @@ class densenet_x(models.DenseNet):
 
 
 #############3
-
+'''
 model_urls = {
     'densenet121': 'https://download.pytorch.org/models/densenet121-a639ec97.pth',
     'densenet169': 'https://download.pytorch.org/models/densenet169-b2777c0a.pth',
     'densenet201': 'https://download.pytorch.org/models/densenet201-c1103571.pth',
     'densenet161': 'https://download.pytorch.org/models/densenet161-8d451a50.pth',
 }
-import re
+
 def _load_state_dict(model, model_url, progress):
     # '.'s are no longer allowed in module names, but previous _DenseLayer
     # has keys 'norm.1', 'relu.1', 'conv.1', 'norm.2', 'relu.2', 'conv.2'.
@@ -357,14 +359,52 @@ def _load_state_dict(model, model_url, progress):
             del state_dict[key]
     model.load_state_dict(state_dict)
 
+
 def _densenet_x(arch, growth_rate, block_config, num_init_features, pretrained, progress,
               **kwargs):
     model = densenet_x(growth_rate, block_config, num_init_features, **kwargs)
     if pretrained:
         _load_state_dict(model, model_urls[arch], progress)
     return model
+'''
 
+def _load_state_dict(model: nn.Module, weights, progress: bool) -> None:
+    # '.'s are no longer allowed in module names, but previous _DenseLayer
+    # has keys 'norm.1', 'relu.1', 'conv.1', 'norm.2', 'relu.2', 'conv.2'.
+    # They are also in the checkpoints in model_urls. This pattern is used
+    # to find such keys.
+    pattern = re.compile(
+        r"^(.*denselayer\d+\.(?:norm|relu|conv))\.((?:[12])\.(?:weight|bias|running_mean|running_var))$"
+    )
 
+    state_dict = weights.get_state_dict(progress=progress, check_hash=True)
+    for key in list(state_dict.keys()):
+        res = pattern.match(key)
+        if res:
+            new_key = res.group(1) + res.group(2)
+            state_dict[new_key] = state_dict[key]
+            del state_dict[key]
+    model.load_state_dict(state_dict)
+
+def _densenet_x(
+    growth_rate: int,
+    block_config: Tuple[int, int, int, int],
+    num_init_features: int,
+    weights: Optional,
+    progress: bool,
+    **kwargs: Any,
+) -> DenseNet:
+    if weights is not None:
+        _ovewrite_named_param(kwargs, "num_classes", len(weights.meta["categories"]))
+
+    model = densenet_x(growth_rate, block_config, num_init_features, **kwargs)
+
+    if weights is not None:
+        _load_state_dict(model=model, weights=weights, progress=progress)
+
+    return model
+
+'''
 def densenet121_x(pretrained=False, progress=True, **kwargs):
     r"""Densenet-121 model from
     `"Densely Connected Convolutional Networks" <https://arxiv.org/pdf/1608.06993.pdf>`_
@@ -377,7 +417,30 @@ def densenet121_x(pretrained=False, progress=True, **kwargs):
 
     return _densenet_x('densenet121', 32, (6, 12, 24, 16), 64, pretrained, progress,
                      **kwargs)
+'''
 
+def densenet121_x(*, weights: Optional[DenseNet121_Weights] = None, progress: bool = True, **kwargs: Any) -> DenseNet:
+    r"""Densenet-121 model from
+    `Densely Connected Convolutional Networks <https://arxiv.org/abs/1608.06993>`_.
+
+    Args:
+        weights (:class:`~torchvision.models.DenseNet121_Weights`, optional): The
+            pretrained weights to use. See
+            :class:`~torchvision.models.DenseNet121_Weights` below for
+            more details, and possible values. By default, no pre-trained
+            weights are used.
+        progress (bool, optional): If True, displays a progress bar of the download to stderr. Default is True.
+        **kwargs: parameters passed to the ``torchvision.models.densenet.DenseNet``
+            base class. Please refer to the `source code
+            <https://github.com/pytorch/vision/blob/main/torchvision/models/densenet.py>`_
+            for more details about this class.
+
+    .. autoclass:: torchvision.models.DenseNet121_Weights
+        :members:
+    """
+    weights = DenseNet121_Weights.verify(weights)
+
+    return _densenet_x(32, (6, 12, 24, 16), 64, weights, progress, **kwargs)
 
 
 
@@ -501,7 +564,9 @@ def runstuff(skip):
 
   #model
   #modeltrained = models.densenet121(pretrained=True)
-  modeltrained = densenet121_x(pretrained=True)
+  #modeltrained = densenet121_x(pretrained=True)
+  modeltrained = densenet121_x(weights = models.densenet.DenseNet121_Weights.DEFAULT)
+
 
   device=torch.device('cpu')
   #device=torch.device('cuda')
@@ -514,7 +579,7 @@ def runstuff(skip):
     'conv2d_ignorebias': True,
     'linear_eps': 1e-6,
     'pooling_eps': 1e-3,
-    'use_zbeta': True,
+    'use_zbeta': False,
   }
 
   lrp_layer2method={
@@ -533,7 +598,7 @@ def runstuff(skip):
   }
 
 
-  model = densenet121_x(pretrained=False)
+  model = densenet121_x()
   model.copyfromdensenet(modeltrained, lrp_params=lrp_params_def1, lrp_layer2method = lrp_layer2method)
   model = model.to(device)
 
