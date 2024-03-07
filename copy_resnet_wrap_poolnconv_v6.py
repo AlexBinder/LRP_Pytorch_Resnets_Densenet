@@ -381,12 +381,12 @@ def runstuff(skip):
   device=torch.device('cpu')
   #device=torch.device('cuda')
 
-  modeltrained = models.resnet18(pretrained=True).to(device)
+
+  modeltrained = models.resnet18(weights=models.ResNet18_Weights.DEFAULT).to(device)
   model = resnet18_canonized(pretrained=False)
-  #modeltrained = models.resnet50(pretrained=True).to(device)
+    
+  #modeltrained = models.resnet50(weights=models.ResNet50_Weights.DEFAULT).to(device)
   #model = resnet50_canonized(pretrained=False)
-  #print(model)
-  #exit()
 
 
   lrp_params_def1={
@@ -394,7 +394,7 @@ def runstuff(skip):
     'eltwise_eps': 1e-6,
     'linear_eps': 1e-6,
     'pooling_eps': 1e-6,
-    'use_zbeta': True ,
+    'use_zbeta': False ,
   }
 
   lrp_layer2method={
